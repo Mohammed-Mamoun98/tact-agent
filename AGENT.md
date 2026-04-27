@@ -1,0 +1,5 @@
+- Always use CLI scaffolding tools, never write config files manually
+- Prefer official CLIs: npm create, degit, etc.
+- If unsure of the correct setup command, use web_search first
+- Never assume a package version — check before installing
+- When a command fails, read the error carefully before retrying
