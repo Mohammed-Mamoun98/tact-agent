@@ -1,18 +1,36 @@
-import { useState, useCallback, useRef } from "react";
-import { Text, Box, useInput } from "ink";
+import { useState, useCallback, useRef, useEffect } from "react";
+import { Text, Box } from "ink";
 import { PlanView } from "./PlanView.tsx";
 import { ConfirmPrompt } from "./ConfirmPrompt.tsx";
 import { AgentProgress, type StepState } from "./AgentProgress.tsx";
+import { TextInput } from "./TextInput.tsx";
+import { StreamingText } from "./StreamingText.tsx";
 import { generatePlan, type Plan } from "../planner.ts";
 import { runAgent, type AgentCallbacks } from "../agent.ts";
-import { callLLM, type Message } from "../llm.ts";
+import { callLLMStream, type Message } from "../llm.ts";
 import { parseCommand, executeCommand, type AgentState } from "../commands.ts";
 import { getModel } from "../config.ts";
 import type { Config } from "../config.ts";
+import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
+import { fileURLToPath } from "node:url";
+
+const __dirname = fileURLToPath(new URL(".", import.meta.url));
+
+function getVersion(): string {
+  try {
+    const pkgPath = resolve(__dirname, "../../package.json");
+    const pkg = JSON.parse(readFileSync(pkgPath, "utf-8"));
+    return pkg.version ?? "0.0.0";
+  } catch {
+    return "0.0.0";
+  }
+}
 
 type Phase =
   | { tag: "idle"; error?: string; lastReply?: string }
-  | { tag: "thinking" }
+  | { tag: "thinking"; startTime: number }
+  | { tag: "streaming"; content: string }
   | { tag: "planning" }
   | { tag: "confirming"; plan: Plan }
   | { tag: "running"; plan: Plan; steps: StepState[] }
@@ -24,15 +42,65 @@ interface Props {
   state: AgentState;
 }
 
+function Header() {
+  const version = getVersion();
+
+  return (
+    <Box flexDirection="column" borderStyle="round" borderColor="gray" paddingX={2} paddingY={1}>
+      <Box>
+        <Text bold color="white">tact-agent</Text>
+        <Text dimColor> ({version})</Text>
+      </Box>
+    </Box>
+  );
+}
+
+function Tip() {
+  return (
+    <Box marginTop={1} marginBottom={1}>
+      <Text bold>Tip: </Text>
+      <Text dimColor>Use /plan to execute tasks step-by-step.</Text>
+    </Box>
+  );
+}
+
+function StatusLine({ config }: { config: Config }) {
+  const alias = config.model_preferences?.default ?? config.providers[0].models[0].alias;
+  const cwd = process.cwd();
+
+  return (
+    <Box marginTop={1}>
+      <Text dimColor>{alias} · {cwd}</Text>
+    </Box>
+  );
+}
+
+function useElapsedTimer(running: boolean): number {
+  const [elapsed, setElapsed] = useState(0);
+  useEffect(() => {
+    if (!running) return;
+    setElapsed(0);
+    const interval = setInterval(() => {
+      setElapsed((s) => s + 1);
+    }, 1000);
+    return () => clearInterval(interval);
+  }, [running]);
+  return elapsed;
+}
+
 export function App({ config, grounding, state }: Props) {
   const [phase, setPhase] = useState<Phase>({ tag: "idle" });
   const [input, setInput] = useState("");
   const historyRef = useRef<Message[]>([]);
+  const abortRef = useRef(false);
 
-  // Direct chat — no plan, just respond
+  const elapsed = useElapsedTimer(phase.tag === "thinking");
+
   const chat = useCallback(
     async (userMessage: string) => {
-      setPhase({ tag: "thinking" });
+      abortRef.current = false;
+      historyRef.current.push({ role: "user", content: userMessage });
+      setPhase({ tag: "streaming", content: "" });
 
       const model = getModel(
         config.model_preferences?.default ?? config.providers[0].models[0].alias,
@@ -41,37 +109,40 @@ export function App({ config, grounding, state }: Props) {
       const messages: Message[] = [
         { role: "system", content: grounding },
         ...historyRef.current,
-        { role: "user", content: userMessage },
       ];
 
       try {
-        const res = await callLLM(model, messages);
+        let fullContent = "";
 
-        if (res.type === "tool_use") {
-          // If the model calls a tool during chat, treat it as a task → route to plan
-          setPhase({ tag: "idle", lastReply: "(detected task intent — use /plan for execution)" });
-          return;
-        }
-
-        historyRef.current.push(
-          { role: "user", content: userMessage },
-          { role: "assistant", content: res.content },
-        );
-
-        // Keep only last 20 messages
-        if (historyRef.current.length > 40) {
-          historyRef.current = historyRef.current.slice(-40);
-        }
-
-        setPhase({ tag: "idle", lastReply: res.content });
+        await callLLMStream(model, messages, {
+          onToken: (token) => {
+            if (abortRef.current) return;
+            fullContent += token;
+            setPhase({ tag: "streaming", content: fullContent });
+          },
+          onDone: () => {
+            if (abortRef.current) return;
+            historyRef.current.push({ role: "assistant", content: fullContent });
+            if (historyRef.current.length > 40) {
+              historyRef.current = historyRef.current.slice(-40);
+            }
+            setPhase({ tag: "idle", lastReply: fullContent });
+          },
+          onError: (e) => {
+            if (!abortRef.current) {
+              setPhase({ tag: "idle", error: e.message });
+            }
+          },
+        });
       } catch (e: any) {
-        setPhase({ tag: "idle", error: e.message });
+        if (!abortRef.current) {
+          setPhase({ tag: "idle", error: e.message });
+        }
       }
     },
     [grounding, config],
   );
 
-  // Plan mode — explicit via /plan command
   const startPlanning = useCallback(
     async (task: string) => {
       setPhase({ tag: "planning" });
@@ -85,7 +156,6 @@ export function App({ config, grounding, state }: Props) {
     [grounding, config],
   );
 
-  // Route input: commands → plan, everything else → chat
   const submitInput = useCallback(
     async (text: string) => {
       const cmd = parseCommand(text);
@@ -98,25 +168,19 @@ export function App({ config, grounding, state }: Props) {
     [state, startPlanning, chat],
   );
 
-  useInput((char, key) => {
-    if (phase.tag !== "idle" && phase.tag !== "done") return;
+  const handleSubmit = useCallback(() => {
+    const text = input.trim();
+    if (!text) return;
+    setInput("");
+    submitInput(text);
+  }, [input, submitInput]);
 
-    if (key.return && input.trim()) {
-      const text = input.trim();
-      setInput("");
-      submitInput(text);
-      return;
+  const handleCancel = useCallback(() => {
+    if (phase.tag === "thinking" || phase.tag === "streaming") {
+      abortRef.current = true;
+      setPhase({ tag: "idle", lastReply: "(interrupted)" });
     }
-
-    if (key.backspace || key.delete) {
-      setInput((prev) => prev.slice(0, -1));
-      return;
-    }
-
-    if (char.length === 1 && !key.ctrl) {
-      setInput((prev) => prev + char);
-    }
-  });
+  }, [phase.tag]);
 
   const startExecution = useCallback(
     async (plan: Plan) => {
@@ -149,6 +213,15 @@ export function App({ config, grounding, state }: Props) {
             return { ...prev, steps: updated };
           });
         },
+        onModelSelect: (stepIndex, modelAlias) => {
+          setPhase((prev) => {
+            if (prev.tag !== "running") return prev;
+            const updated = [...prev.steps];
+            const idx = updated.findIndex((s) => s.index === stepIndex);
+            if (idx >= 0) updated[idx] = { ...updated[idx], model: modelAlias };
+            return { ...prev, steps: updated };
+          });
+        },
         onToolCall: (tool, _input) => {
           setPhase((prev) => {
             if (prev.tag !== "running") return prev;
@@ -172,60 +245,94 @@ export function App({ config, grounding, state }: Props) {
     [grounding, state],
   );
 
-  // Done → Enter to go back to idle; /plan from done
-  useInput((_char, key) => {
-    if (phase.tag !== "done") return;
-    if (key.return) setPhase({ tag: "idle" });
-  });
+  const renderMessages = () =>
+    historyRef.current.map((msg, i) => {
+      const isUser = msg.role === "user";
+      return (
+        <Box
+          key={i}
+          flexDirection="column"
+          marginTop={1}
+          paddingX={1}
+          paddingY={0}
+          {...(isUser ? { backgroundColor: "#E8EDF2" } : {})}
+        >
+          <Text>{msg.content}</Text>
+        </Box>
+      );
+    });
 
   switch (phase.tag) {
     case "idle":
       return (
         <Box flexDirection="column" padding={1}>
-          <Box>
-            <Text bold color="cyan">
-              tact
-            </Text>
-            <Text dimColor> — minimal AI coding agent</Text>
-          </Box>
-          <Box marginTop={1}>
-            <Text dimColor>/plan to execute tasks · anything else is chat</Text>
-          </Box>
+          <Header />
+          <Tip />
           {phase.error && (
             <Box marginTop={1}>
               <Text color="red">{phase.error}</Text>
             </Box>
           )}
-          {phase.lastReply && (
-            <Box flexDirection="column" marginTop={1} borderStyle="single" borderColor="gray" padding={1}>
-              <Text>{phase.lastReply}</Text>
-            </Box>
-          )}
-          <Box marginTop={1}>
-            <Text color="yellow">{"> "}</Text>
-            <Text>{input}</Text>
-            <Text dimColor>█</Text>
+          {renderMessages()}
+          <Box
+            marginTop={1}
+            borderStyle="round"
+            borderColor="gray"
+            paddingX={1}
+            paddingY={0}
+          >
+            <TextInput
+              value={input}
+              onChange={setInput}
+              onSubmit={handleSubmit}
+              onCancel={handleCancel}
+              placeholder="Type a message..."
+            />
+          </Box>
+          <StatusLine config={config} />
+        </Box>
+      );
+
+    case "streaming":
+      return (
+        <Box flexDirection="column" padding={1}>
+          <Header />
+          {renderMessages()}
+          <Box marginTop={1} paddingX={1} paddingY={0}>
+            <StreamingText content={phase.content} />
           </Box>
         </Box>
       );
 
-    case "thinking":
+    case "thinking": {
+      const seconds = elapsed;
       return (
-        <Box padding={1}>
-          <Text dimColor>…</Text>
+        <Box flexDirection="column" padding={1}>
+          <Header />
+          {renderMessages()}
+          <Box marginTop={1}>
+            <Text color="cyan">● </Text>
+            <Text bold>Working</Text>
+            <Text dimColor> ({seconds}s • esc to interrupt)</Text>
+          </Box>
         </Box>
       );
+    }
 
     case "planning":
       return (
-        <Box padding={1}>
-          <Text dimColor>Generating plan...</Text>
+        <Box flexDirection="column" padding={1}>
+          <Header />
+          <Box marginTop={1}>
+            <Text dimColor>Generating plan...</Text>
+          </Box>
         </Box>
       );
 
     case "confirming":
       return (
         <Box flexDirection="column" padding={1}>
+          <Header />
           <PlanView plan={phase.plan} />
           <ConfirmPrompt
             onConfirm={() => startExecution(phase.plan)}
@@ -237,6 +344,7 @@ export function App({ config, grounding, state }: Props) {
     case "running":
       return (
         <Box flexDirection="column" padding={1}>
+          <Header />
           <AgentProgress plan={phase.plan} steps={phase.steps} />
           <Box marginTop={1}>
             <Text dimColor>
@@ -249,6 +357,7 @@ export function App({ config, grounding, state }: Props) {
     case "done":
       return (
         <Box flexDirection="column" padding={1}>
+          <Header />
           <AgentProgress plan={phase.plan} steps={phase.steps} />
           <Box marginTop={1}>
             <Text bold color="green">
